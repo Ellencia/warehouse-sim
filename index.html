@@ -28,7 +28,7 @@
 <div id="panel">
   <div class="nums">
     <div><b id="nPending">0</b><span>대기 주문 (품절 <span id="nBack">0</span>)</span></div>
-    <div><b id="nOut">0</b><span>품절 자리</span></div>
+    <div><b id="nOut">0</b><span>품절 자리 (하역장 <span id="nRecv">0</span>)</span></div>
     <div><b id="nDock">0</b><span>출고 대기 상자</span></div>
   </div>
   <table>
@@ -47,7 +47,7 @@
       <option value="longestIdle">오래 쉰 로봇 우선</option>
     </select></label>
   <label><input id="oneWay" type="checkbox"> 통로 일방통행</label>
-  <label>재입고 시간 <span id="vRestock"></span>초
+  <label>입고 트럭 간격 <span id="vRestock"></span>초
     <input id="restock" type="range" min="10" max="300" step="10" value="60"></label>
   <label>트럭 간격 <span id="vTruck"></span>초
     <input id="truck" type="range" min="10" max="180" step="5" value="40"></label>
@@ -73,7 +73,7 @@ const bind = () => {
   sim.want = +$('robots').value; sim.rate = +$('rate').value; sim.rule = $('rule').value;
   sim.truckEvery = +$('truck').value * TPS;
   sim.oneWay = $('oneWay').checked;
-  sim.restockEvery = +$('restock').value * TPS;
+  sim.inboundEvery = +$('restock').value * TPS;
   $('vRestock').textContent = $('restock').value;
   $('vRobots').textContent = sim.want; $('vRate').textContent = sim.rate; $('vTruck').textContent = $('truck').value;
 };
@@ -180,9 +180,16 @@ for (let b = 0; b < 6; b++) [0.05, 1.25, 2.4].forEach((y, l) => {
     put(0.8 + b * 2.2 + k, -3.1, y, s, s * 0.95, 0.8, CARD);
   }
 });
-put(12.3, -1.6, 0.15, 0.9, 0.6, 1.5, YELLOW);
-put(12.3, -1.9, 0.75, 0.8, 0.9, 0.7, DARK);
-put(12.3, -0.8, 0, 0.7, 2, 0.08, DARK);
+// 지게차는 장식이 아니다: 하역장에서 보충 상자를 들고 선반까지 다녀온다 (마지막 자식 = 들고 있는 상자)
+const forkMesh = sim.forks.map(() => {
+  const g = new THREE.Group();
+  bx(g, 0, 0.15, 0, 0.9, 0.6, 1.5, YELLOW);
+  bx(g, 0, 0.75, -0.3, 0.8, 0.9, 0.7, DARK);
+  bx(g, 0, 0, 0.8, 0.7, 2, 0.08, DARK);
+  bx(g, 0, 0.3, 1.1, 0.6, 0.5, 0.5, TOTE);
+  scene.add(g);
+  return g;
+});
 put(-3.6, -3.7, 1.6, 2.6, 1.3, 0.1, 0x10131a);
 put(-3.6, -3.2, 0, 2.4, 0.8, 0.7, 0xf2f3f5);
 many([[-5, -2.4, 0, 0.1, 2.6, 0.1], [-2.2, -2.4, 0, 0.1, 2.6, 0.1], [-3.6, -2.4, 2.6, 2.9, 0.1, 0.1]], DARK);
@@ -353,6 +360,16 @@ function frame(now) {
     m.position.z = mix(p[1], q[1]) - OZ;
   });
 
+  // 지게차: 하역장 → 뒷줄을 따라 옆으로 → 통로로 들어감. 갈 때만 상자를 들고 있다
+  sim.forks.forEach((f, i) => {
+    const g = forkMesh[i], [hx, hy] = sim.forkHome, busy = f.k >= 0;
+    const tt = busy ? f.t + a : 0;
+    const d = !busy ? 0 : tt <= f.go ? Math.min(tt, f.travel) : Math.max(0, f.travel - (tt - f.go));
+    const dx = hx - f.px;
+    g.position.set((d <= dx ? hx - d : f.px) - OX, 0, (d <= dx ? hy : hy + d - dx) - OZ);
+    g.children[3].visible = busy && f.t < f.go;
+  });
+
   arrows.visible = sim.oneWay;
   dockMesh.forEach((m, i) => { m.visible = i < sim.dock.length; });
   truckMesh.position.x += ((sim.truckHere ? TRUCK_X : TRUCK_X - 12) - truckMesh.position.x) * 0.08;
@@ -360,7 +377,8 @@ function frame(now) {
   $('nDock').textContent = sim.dock.length;
   $('nPending').textContent = sim.pending.length;
   $('nBack').textContent = sim.pending.filter(o => !sim.stock[slot(o)]).length;
-  $('nOut').textContent = sim.restockAt.size;
+  $('nOut').textContent = sim.refill.size;
+  $('nRecv').textContent = [...sim.refill.values()].filter(v => v === 'dock').length;
   for (const [p, st] of [['r', sim.robot], ['t', sim.truck]]) {
     $(p + 'Rate').textContent = sim.perMin(st).toFixed(1);
     $(p + 'Avg').textContent = st.dur.length ? sim.avgSec(st).toFixed(1) + '초' : '–';
