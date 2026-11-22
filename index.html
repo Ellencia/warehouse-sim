@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>창고 시뮬</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0c10; color: #e8eaee;
+    font: 14px/1.4 system-ui, "Malgun Gothic", sans-serif; }
+  canvas { display: block; touch-action: none; }
+  #panel { position: fixed; top: 12px; left: 12px; width: 220px; padding: 12px 14px;
+    background: rgba(20, 23, 28, .85); border: 1px solid #333a45; border-radius: 10px; }
+  .nums { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 10px; }
+  .nums b { display: block; font-size: 26px; font-variant-numeric: tabular-nums; }
+  .nums span { color: #9aa3b0; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th { color: #9aa3b0; font-size: 12px; font-weight: normal; text-align: right; }
+  td { padding: 3px 0; text-align: right; font-size: 16px; font-weight: 600; }
+  td:first-child { text-align: left; font-size: 14px; font-weight: normal; }
+  small { color: #9aa3b0; font-size: 11px; }
+  td small { display: block; }
+  label { display: block; margin-top: 10px; color: #c5cbd5; }
+  input[type=range], select { width: 100%; margin-top: 4px; }
+  select { background: #1e232b; color: inherit; border: 1px solid #333a45; border-radius: 6px; padding: 4px; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <div class="nums">
+    <div><b id="nPending">0</b><span>대기 주문 (품절 <span id="nBack">0</span>)</span></div>
+    <div><b id="nOut">0</b><span>품절 자리</span></div>
+    <div><b id="nDock">0</b><span>출고 대기 상자</span></div>
+  </div>
+  <table>
+    <tr><th></th><th>분당</th><th>평균</th></tr>
+    <tr><td>로봇 단계<small>주문→포장</small></td><td id="rRate">–</td><td id="rAvg">–</td></tr>
+    <tr><td>트럭 단계<small>포장→트럭</small></td><td id="tRate">–</td><td id="tAvg">–</td></tr>
+  </table>
+  <small>분당은 최근 2분, 평균은 최근 50건</small>
+  <label>로봇 <span id="vRobots"></span>대
+    <input id="robots" type="range" min="1" max="12" value="4"></label>
+  <label>주문 속도 분당 <span id="vRate"></span>건
+    <input id="rate" type="range" min="5" max="120" step="5" value="20"></label>
+  <label>배정 규칙
+    <select id="rule">
+      <option value="nearest">가까운 로봇 우선</option>
+      <option value="longestIdle">오래 쉰 로봇 우선</option>
+    </select></label>
+  <label><input id="oneWay" type="checkbox"> 통로 일방통행</label>
+  <label>재입고 시간 <span id="vRestock"></span>초
+    <input id="restock" type="range" min="10" max="300" step="10" value="60"></label>
+  <label>트럭 간격 <span id="vTruck"></span>초
+    <input id="truck" type="range" min="10" max="180" step="5" value="40"></label>
+</div>
+
+<script src="sim.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = id => document.getElementById(id);
+const sim = createSim({ robots: +$('robots').value, rate: +$('rate').value, rule: $('rule').value, seed: Date.now() });
+const { W, TPS, LEVELS } = sim;
+
+// 손잡이 → 로직
+const bind = () => {
+  sim.want = +$('robots').value; sim.rate = +$('rate').value; sim.rule = $('rule').value;
+  sim.truckEvery = +$('truck').value * TPS;
+  sim.oneWay = $('oneWay').checked;
+  sim.restockEvery = +$('restock').value * TPS;
+  $('vRestock').textContent = $('restock').value;
+  $('vRobots').textContent = sim.want; $('vRate').textContent = sim.rate; $('vTruck').textContent = $('truck').value;
+};
+for (const id of ['robots', 'rate', 'rule', 'truck', 'oneWay', 'restock']) $(id).addEventListener('input', bind);
+bind();
+
+// ── 화면: 로직 상태를 읽어서 그리기만 한다 ──
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0c10);
+const camera = new THREE.PerspectiveCamera(30, 1, 1, 200);
+const d = Math.max(1, 1.3 / (innerWidth / innerHeight)); // 세로 화면이면 뒤로 물러남
+camera.position.set(15 * d, 21 * d, 25 * d);              // 앞-오른쪽 위에서 내려다보는 구도
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 1);
+controls.maxPolarAngle = Math.PI / 2.1;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f9a, 1.5));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(-8, 24, 12);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -18, right: 18, top: 18, bottom: -18, near: 1, far: 70 });
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+
+// 칸 좌표(cx, cy) → 세계 좌표. 건물 중심이 원점에 오도록 민다.
+const OX = 4, OZ = 5;
+const unit = new THREE.BoxGeometry(1, 1, 1);
+const mats = {};
+const mat = c => (mats[c] ??= new THREE.MeshStandardMaterial({ color: c, roughness: 0.8 }));
+// 부모 기준 (x, 바닥 높이 y0, z)에 w×h×dp 상자
+function bx(parent, x, y0, z, w, h, dp, color, own) {
+  const m = new THREE.Mesh(unit, own ? new THREE.MeshStandardMaterial({ color, roughness: 0.8 }) : mat(color));
+  m.scale.set(w, h, dp);
+  m.position.set(x, y0 + h / 2, z);
+  m.castShadow = m.receiveShadow = true;
+  parent.add(m);
+  return m;
+}
+const put = (cx, cy, y0, w, h, dp, color, own) => bx(scene, cx - OX, y0, cy - OZ, w, h, dp, color, own);
+// 같은 상자 여러 개를 한 번에 (기둥·선반판)
+function many(list, color) {
+  const im = new THREE.InstancedMesh(unit, mat(color), list.length), o = new THREE.Object3D();
+  list.forEach(([cx, cy, y0, w, h, dp], i) => {
+    o.position.set(cx - OX, y0 + h / 2, cy - OZ); o.scale.set(w, h, dp); o.updateMatrix();
+    im.setMatrixAt(i, o.matrix);
+  });
+  im.castShadow = im.receiveShadow = true;
+  scene.add(im);
+}
+function label(text) {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 48;
+  const g = c.getContext('2d');
+  g.fillStyle = '#111418'; g.beginPath(); g.roundRect(2, 2, 124, 44, 8); g.fill();
+  g.fillStyle = '#fff'; g.font = 'bold 28px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(text, 64, 26);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false }));
+  s.scale.set(0.95, 0.36, 1);
+  s.renderOrder = 10;
+  return s;
+}
+function worker(cx, cy, vest) {
+  const g = new THREE.Group();
+  g.position.set(cx - OX, 0, cy - OZ);
+  bx(g, 0, 0, 0, 0.22, 0.45, 0.16, 0x2a3350);
+  bx(g, 0, 0.45, 0, 0.3, 0.42, 0.2, vest);
+  bx(g, 0, 0.87, 0, 0.18, 0.18, 0.18, 0xe8b98f);
+  bx(g, 0, 1.05, 0, 0.24, 0.07, 0.24, 0xffffff);
+  scene.add(g);
+}
+
+const WALL = 0xe4e6ea, NAVY = 0x1d2b4f, DARK = 0x23262d, YELLOW = 0xf2c200, BLUE = 0x2a56b0, ORANGE = 0xf08a24,
+  CARD = 0xd9b27c, STEEL = 0x9aa0aa, TOTE = 0x2f6fd0, RED = 0xd94030;
+
+// 건물: 바닥, 로봇 구역 바닥, 보행로, 뒷벽·왼벽(앞과 오른쪽은 잘라 냄), 출고 문
+put(4, 5, -0.4, 19, 0.4, 18, 0x33363d);
+put(4, 5, 0, 19, 0.02, 18, 0xc9ccd2);
+put(6, 5, 0.02, 13, 0.02, 11, 0x2b2f3a);
+put(5.5, 13.3, 0.02, 16, 0.02, 0.5, 0x2fa56b);
+put(4, -4.1, 0, 19.2, 4.2, 0.2, WALL);
+put(4, -3.98, 0, 19, 0.9, 0.05, NAVY);
+// 왼벽은 허리 높이로 낮춰서 문 밖 트럭이 보이게 한다. 문은 틀만 세운다.
+for (const [a, b] of [[-4, 6.8], [9.2, 10.3], [12.7, 14]]) {
+  put(-5.6, (a + b) / 2, 0, 0.2, 1, b - a, WALL);
+  put(-5.48, (a + b) / 2, 0, 0.05, 0.9, b - a, NAVY);
+}
+for (const cy of [8, 11.5]) {
+  put(-5.6, cy - 1.2, 0, 0.2, 2.8, 0.15, WALL);
+  put(-5.6, cy + 1.2, 0, 0.2, 2.8, 0.15, WALL);
+  put(-5.6, cy, 2.8, 0.2, 0.25, 2.55, 0xf2f3f5);
+}
+
+// 뒷벽 팔레트 랙 + 골판지 상자, 지게차, 관제 화면 (장식)
+many(Array.from({ length: 7 }, (_, i) => [0.2 + i * 2.2, -3.1, 0, 0.1, 3.5, 0.9]), BLUE);
+many([1.15, 2.3].map(y => [6.8, -3.1, y, 13.2, 0.1, 0.9]), ORANGE);
+for (let b = 0; b < 6; b++) [0.05, 1.25, 2.4].forEach((y, l) => {
+  for (let k = 0; k < 2; k++) {
+    const s = 0.75 + ((b * 7 + k * 3 + l * 5) % 4) * 0.06;
+    put(0.8 + b * 2.2 + k, -3.1, y, s, s * 0.95, 0.8, CARD);
+  }
+});
+put(12.3, -1.6, 0.15, 0.9, 0.6, 1.5, YELLOW);
+put(12.3, -1.9, 0.75, 0.8, 0.9, 0.7, DARK);
+put(12.3, -0.8, 0, 0.7, 2, 0.08, DARK);
+put(-3.6, -3.7, 1.6, 2.6, 1.3, 0.1, 0x10131a);
+put(-3.6, -3.2, 0, 2.4, 0.8, 0.7, 0xf2f3f5);
+many([[-5, -2.4, 0, 0.1, 2.6, 0.1], [-2.2, -2.4, 0, 0.1, 2.6, 0.1], [-3.6, -2.4, 2.6, 2.9, 0.1, 0.1]], DARK);
+
+// 로봇 구역 울타리 (작업대 앞은 뚫려 있음)
+const posts = [];
+for (let x = -0.5; x <= 12.5; x++) posts.push([x, -0.5, 0, 0.07, 1, 0.07], [x, 10.5, 0, 0.07, 1, 0.07]);
+for (let y = 0.5; y <= 9.5; y++) posts.push([-0.5, y, 0, 0.07, 1, 0.07], [12.5, y, 0, 0.07, 1, 0.07]);
+many(posts, YELLOW);
+const gaps = [-0.5, ...sim.stationX.flatMap(x => [x - 0.5, x + 0.5]), 12.5];
+const rails = [[6, -0.5, 0.9, 13, 0.05, 0.04], [-0.5, 5, 0.9, 0.04, 0.05, 11], [12.5, 5, 0.9, 0.04, 0.05, 11]];
+for (let i = 0; i < gaps.length; i += 2) rails.push([(gaps[i] + gaps[i + 1]) / 2, 10.5, 0.9, gaps[i + 1] - gaps[i], 0.05, 0.04]);
+many(rails, STEEL);
+
+// 작업대: 노란 문틀 + 작업자 + 이름표
+sim.stationX.forEach((sx, i) => {
+  many([[sx - 0.45, 10.6, 0, 0.09, 1.8, 0.09], [sx + 0.45, 10.6, 0, 0.09, 1.8, 0.09], [sx, 10.6, 1.8, 1, 0.09, 0.09]], YELLOW);
+  worker(sx, 11.15, 0xff8a1f);
+  put(sx + 0.6, 11.15, 0, 0.5, 0.55, 0.5, STEEL);
+  put(sx + 0.6, 11.15, 0.55, 0.42, 0.22, 0.42, RED);
+  const t = label('ST-0' + (i + 1));
+  t.position.set(sx - OX, 2.3, 10.6 - OZ);
+  scene.add(t);
+});
+
+// 컨베이어: 앞변을 따라 왼쪽으로, 왼쪽 변을 타고 뒤로. 끝이 포장 구역.
+function rollers(len, turn) {
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 16;
+  const g = c.getContext('2d');
+  g.fillStyle = '#b9bec8'; g.fillRect(0, 0, 16, 16);
+  g.fillStyle = '#4a4f59'; g.fillRect(0, 0, 4, 16);
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(len * 3, 1);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(len, 0.56), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.6 }));
+  m.rotation.x = -Math.PI / 2;
+  if (turn) m.rotation.z = Math.PI / 2;
+  m.receiveShadow = true;
+  scene.add(m);
+  return m;
+}
+put(5.075, 12, 0.7, 14.85, 0.1, 0.7, 0x3b4a6b);
+put(-2, 7.425, 0.7, 0.7, 0.1, 9.85, 0x3b4a6b);
+rollers(14.85).position.set(5.075 - OX, 0.805, 12 - OZ);
+rollers(9.85, true).position.set(-2 - OX, 0.805, 7.425 - OZ);
+many([...[-2, 0, 2, 4, 6, 8, 10, 12].map(x => [x, 12, 0, 0.1, 0.7, 0.6]), ...[4, 6, 8, 10].map(y => [-2, y, 0, 0.6, 0.7, 0.1])], DARK);
+put(-2, 1.9, 0, 0.9, 0.7, 1, 0xf2f3f5);
+worker(-2.9, 3, 0xff8a1f);
+worker(-1.2, 3.6, 0xf2c200);
+worker(-1.1, 2.2, 0xff8a1f);
+
+// 출고: 포장된 상자가 문 앞에 쌓이고, 트럭이 문 밖에 와서 실어 간다.
+// 로직엔 한도가 없고, 그림은 4×3칸 4층(48개)까지만 쌓아 보여 준다. 정확한 수는 패널 숫자.
+const dockMesh = Array.from({ length: 48 }, (_, i) =>
+  put(-5 + (i % 4) * 0.55, 4.4 + ((i >> 2) % 3) * 0.65, ((i / 12) | 0) * 0.47, 0.5, 0.45, 0.5, CARD));
+put(-8.6, 9, -0.4, 5.8, 0.4, 10, 0x1c1e23);
+const truckMesh = new THREE.Group();
+bx(truckMesh, 0, 0.5, 0, 3.6, 2.3, 2.1, 0xf2f3f5);    // 짐칸 (뒤가 문 쪽)
+bx(truckMesh, -2.6, 0.3, 0, 1.4, 1.8, 2, 0x2a56b0);   // 운전석
+bx(truckMesh, 0.9, 0, 0, 0.7, 0.5, 2.2, DARK);
+bx(truckMesh, -2.6, 0, 0, 0.7, 0.5, 2.2, DARK);
+const TRUCK_X = -7.6 - OX;                            // 문에 댄 자리. 없을 땐 왼쪽 멀리
+truckMesh.position.set(TRUCK_X - 12, 0, 8 - OZ);
+scene.add(truckMesh);
+
+// 구역 안 낮은 선반: 칸마다 단 수만큼 판 + 파란 상자
+const shelfMesh = new Map(), boards = [], legs = [];
+for (const s of sim.shelves) {
+  const cx = s.cell % W, cy = (s.cell / W) | 0, side = Math.sign(s.pick % W - cx) * 0.45;
+  legs.push([cx + side, cy - 0.47, 0, 0.05, 1.3, 0.05], [cx + side, cy + 0.47, 0, 0.05, 1.3, 0.05]);
+  for (let l = 0; l < LEVELS; l++) {
+    boards.push([cx, cy, 0.05 + l * 0.42, 0.98, 0.04, 0.98]);
+    const m = put(cx, cy, 0.09 + l * 0.42, 0.72, 0.28, 0.8, TOTE, true);
+    m.userData.y0 = 0.09 + l * 0.42;
+    shelfMesh.set(s.cell * LEVELS + l, m);
+  }
+}
+many(boards, ORANGE);
+many(legs, BLUE);
+const C_TOTE = new THREE.Color(TOTE), C_WANTED = new THREE.Color(0xffb020);
+const C_EMPTY = new THREE.Color(0x1b1e24);
+// 재고: 줄수록 파랑이 어두워지고, 바닥나면 회색. 품절인데 주문이 걸려 있으면 빨강.
+const C_LOW = new THREE.Color(0x16305f), C_OUT = new THREE.Color(0x7a808c), C_BACK = new THREE.Color(0xe0453a), tmp = new THREE.Color();
+const C_HINT = new THREE.Color(0xf6dfa4); // 아랫단에 주문이 걸린 칸의 맨 윗상자 (옅은 노랑)
+
+// 일방통행일 때만 보이는 통로 바닥 화살표
+const arrows = new THREE.Group();
+{
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d');
+  g.strokeStyle = '#ffd23a'; g.lineWidth = 9; g.lineCap = g.lineJoin = 'round';
+  g.beginPath(); g.moveTo(14, 38); g.lineTo(32, 18); g.lineTo(50, 38); g.stroke();
+  const m = new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true });
+  const geo = new THREE.PlaneGeometry(0.7, 0.7);
+  for (const [x, dir] of Object.entries(sim.aisleDir)) for (let cy = sim.aisleY[0] + 1; cy < sim.aisleY[1]; cy += 2) {
+    const p = new THREE.Mesh(geo, m);
+    p.rotation.x = -Math.PI / 2;           // 눕히면 화살표가 뒤쪽을 가리킨다
+    if (dir > 0) p.rotation.z = Math.PI;   // 앞쪽 방향 통로는 뒤집는다
+    p.position.set(+x - OX, 0.05, cy - OZ);
+    arrows.add(p);
+  }
+}
+scene.add(arrows);
+
+const robotMesh = [];
+function robotAt(i) {
+  if (!robotMesh[i]) {
+    const g = new THREE.Group();
+    bx(g, 0, 0.05, 0, 0.74, 0.2, 0.74, DARK);
+    bx(g, 0, 0.25, 0, 0.76, 0.04, 0.76, 0xff7a1a);
+    bx(g, 0, 0.29, 0, 0.6, 0.28, 0.66, TOTE);      // children[2]: 싣고 있는 상자
+    const t = label('R-' + String(i + 1).padStart(2, '0'));
+    t.position.y = 1.75;
+    g.add(t);
+    scene.add(g);
+    robotMesh[i] = g;
+  }
+  return robotMesh[i];
+}
+const beltMesh = sim.belt.map(() => { const m = put(0, 0, 0.81, 0.5, 0.26, 0.5, RED); m.visible = false; return m; });
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+let last = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min((now - last) / 1000, 0.25); // 탭이 숨었다 돌아와도 몰아서 돌리지 않음
+  last = now;
+  while (acc >= 1 / TPS) { sim.tick(); acc -= 1 / TPS; }
+  const a = acc * TPS, mix = (p, q) => p + (q - p) * a;
+
+  const slot = o => o.shelf * LEVELS + o.level;
+  const wanted = new Set(sim.pending.map(slot));
+  for (const r of sim.robots) if (r.state === 'toPick' || r.state === 'picking') wanted.add(slot(r.order));
+  const hot = new Set([...wanted].map(k => (k / LEVELS) | 0));
+  const carrying = r => ['toDrop', 'dropping', 'toReturn', 'returning'].includes(r.state);
+  const gone = new Set(sim.robots.filter(carrying).map(r => slot(r.order || r.tote))); // 로봇이 들고 나간 자리는 비어 보인다
+  for (const [k, m] of shelfMesh) {
+    const empty = gone.has(k);                 // 빈자리는 상자 대신 어두운 깔판으로
+    m.scale.set(empty ? 0.99 : 0.72, empty ? 0.02 : 0.28, empty ? 0.99 : 0.8);
+    m.position.y = m.userData.y0 + (empty ? 0.01 : 0.14);
+    const n = sim.stock[k];
+    m.material.color.copy(empty ? C_EMPTY : wanted.has(k) ? (n ? C_WANTED : C_BACK) : !n ? C_OUT
+      : k % LEVELS === LEVELS - 1 && hot.has((k / LEVELS) | 0) ? C_HINT : tmp.copy(C_LOW).lerp(C_TOTE, n / sim.STOCK_CAP));
+  }
+
+  robotMesh.forEach((g, i) => { g.visible = i < sim.robots.length; });
+  for (const r of sim.robots) {
+    const g = robotAt(r.id);
+    g.visible = true;
+    g.position.set(mix(r.prev % W, r.cell % W) - OX, 0, mix((r.prev / W) | 0, (r.cell / W) | 0) - OZ);
+    g.children[2].visible = carrying(r);
+  }
+
+  sim.belt.forEach((o, i) => {
+    const m = beltMesh[i];
+    m.visible = !!o;
+    if (!o) return;
+    const p = sim.beltPath[o.bp], q = sim.beltPath[o.bi];
+    m.position.x = mix(p[0], q[0]) - OX;
+    m.position.z = mix(p[1], q[1]) - OZ;
+  });
+
+  arrows.visible = sim.oneWay;
+  dockMesh.forEach((m, i) => { m.visible = i < sim.dock.length; });
+  truckMesh.position.x += ((sim.truckHere ? TRUCK_X : TRUCK_X - 12) - truckMesh.position.x) * 0.08;
+  truckMesh.visible = truckMesh.position.x > TRUCK_X - 10;
+  $('nDock').textContent = sim.dock.length;
+  $('nPending').textContent = sim.pending.length;
+  $('nBack').textContent = sim.pending.filter(o => !sim.stock[slot(o)]).length;
+  $('nOut').textContent = sim.restockAt.size;
+  for (const [p, st] of [['r', sim.robot], ['t', sim.truck]]) {
+    $(p + 'Rate').textContent = sim.perMin(st).toFixed(1);
+    $(p + 'Avg').textContent = st.dur.length ? sim.avgSec(st).toFixed(1) + '초' : '–';
+  }
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
