@@ -35,6 +35,7 @@
     <tr><th></th><th>분당</th><th>평균</th></tr>
     <tr><td>로봇 단계<small>주문→포장</small></td><td id="rRate">–</td><td id="rAvg">–</td></tr>
     <tr><td>트럭 단계<small>포장→트럭</small></td><td id="tRate">–</td><td id="tAvg">–</td></tr>
+    <tr><td>품절 대기<small>품절→다시 채움</small></td><td id="bRate">–</td><td id="bAvg">–</td></tr>
   </table>
   <small>분당은 최근 2분, 평균은 최근 50건</small>
   <label>로봇 <span id="vRobots"></span>대
@@ -49,6 +50,8 @@
   <label><input id="oneWay" type="checkbox"> 통로 일방통행</label>
   <label>입고 트럭 간격 <span id="vRestock"></span>초
     <input id="restock" type="range" min="10" max="300" step="10" value="60"></label>
+  <label>지게차 <span id="vForks"></span>대
+    <input id="forks" type="range" min="0" max="4" value="1"></label>
   <label>트럭 간격 <span id="vTruck"></span>초
     <input id="truck" type="range" min="10" max="180" step="5" value="40"></label>
 </div>
@@ -74,10 +77,11 @@ const bind = () => {
   sim.truckEvery = +$('truck').value * TPS;
   sim.oneWay = $('oneWay').checked;
   sim.inboundEvery = +$('restock').value * TPS;
-  $('vRestock').textContent = $('restock').value;
+  sim.wantForks = +$('forks').value;
+  $('vRestock').textContent = $('restock').value; $('vForks').textContent = sim.wantForks;
   $('vRobots').textContent = sim.want; $('vRate').textContent = sim.rate; $('vTruck').textContent = $('truck').value;
 };
-for (const id of ['robots', 'rate', 'rule', 'truck', 'oneWay', 'restock']) $(id).addEventListener('input', bind);
+for (const id of ['robots', 'rate', 'rule', 'truck', 'oneWay', 'restock', 'forks']) $(id).addEventListener('input', bind);
 bind();
 
 // ── 화면: 로직 상태를 읽어서 그리기만 한다 ──
@@ -181,7 +185,7 @@ for (let b = 0; b < 6; b++) [0.05, 1.25, 2.4].forEach((y, l) => {
   }
 });
 // 지게차는 장식이 아니다: 하역장에서 보충 상자를 들고 선반까지 다녀온다 (마지막 자식 = 들고 있는 상자)
-const forkMesh = sim.forks.map(() => {
+const forkMesh = Array.from({ length: +$('forks').max }, () => {
   const g = new THREE.Group();
   bx(g, 0, 0.15, 0, 0.9, 0.6, 1.5, YELLOW);
   bx(g, 0, 0.75, -0.3, 0.8, 0.9, 0.7, DARK);
@@ -247,14 +251,28 @@ worker(-1.1, 2.2, 0xff8a1f);
 const dockMesh = Array.from({ length: 48 }, (_, i) =>
   put(-5 + (i % 4) * 0.55, 4.4 + ((i >> 2) % 3) * 0.65, ((i / 12) | 0) * 0.47, 0.5, 0.45, 0.5, CARD));
 put(-8.6, 9, -0.4, 5.8, 0.4, 10, 0x1c1e23);
-const truckMesh = new THREE.Group();
-bx(truckMesh, 0, 0.5, 0, 3.6, 2.3, 2.1, 0xf2f3f5);    // 짐칸 (뒤가 문 쪽)
-bx(truckMesh, -2.6, 0.3, 0, 1.4, 1.8, 2, 0x2a56b0);   // 운전석
-bx(truckMesh, 0.9, 0, 0, 0.7, 0.5, 2.2, DARK);
-bx(truckMesh, -2.6, 0, 0, 0.7, 0.5, 2.2, DARK);
+function mkTruck(cab) {
+  const g = new THREE.Group();
+  bx(g, 0, 0.5, 0, 3.6, 2.3, 2.1, 0xf2f3f5);    // 짐칸 (뒤가 문 쪽)
+  bx(g, -2.6, 0.3, 0, 1.4, 1.8, 2, cab);        // 운전석
+  bx(g, 0.9, 0, 0, 0.7, 0.5, 2.2, DARK);
+  bx(g, -2.6, 0, 0, 0.7, 0.5, 2.2, DARK);
+  scene.add(g);
+  return g;
+}
+const truckMesh = mkTruck(0x2a56b0);
 const TRUCK_X = -7.6 - OX;                            // 문에 댄 자리. 없을 땐 왼쪽 멀리
 truckMesh.position.set(TRUCK_X - 12, 0, 8 - OZ);
-scene.add(truckMesh);
+
+// 입고: 트럭이 건물 오른쪽(벽 없는 쪽) 뒤편에 대고, 내린 보충 상자가 지게차 옆 하역장에 쌓인다.
+// 로직엔 한도가 없고, 그림은 2×3칸 6층(36개)까지만. 정확한 수는 패널의 "하역장" 숫자.
+const recvMesh = Array.from({ length: 36 }, (_, i) =>
+  put(12.8 + (i % 2) * 0.45, -2.2 + ((i >> 1) % 3) * 0.6, ((i / 6) | 0) * 0.32, 0.42, 0.3, 0.5, TOTE));
+put(16.5, -1.6, -0.4, 6, 0.4, 5, 0x1c1e23);
+const inTruck = mkTruck(0x2f8f5b);
+inTruck.rotation.y = Math.PI;                         // 짐칸 뒤가 건물 쪽(왼쪽)을 보게 돌린다
+const IN_X = 15.5 - OX;                               // 하역장에 댄 자리. 없을 땐 오른쪽 멀리
+inTruck.position.set(IN_X + 12, 0, -1.6 - OZ);
 
 // 구역 안 낮은 선반: 칸마다 단 수만큼 판 + 파란 상자
 const shelfMesh = new Map(), boards = [], legs = [];
@@ -366,9 +384,15 @@ function frame(now) {
     const tt = busy ? f.t + a : 0;
     const d = !busy ? 0 : tt <= f.go ? Math.min(tt, f.travel) : Math.max(0, f.travel - (tt - f.go));
     const dx = hx - f.px;
-    g.position.set((d <= dx ? hx - d : f.px) - OX, 0, (d <= dx ? hy : hy + d - dx) - OZ);
+    const park = i * 1.1 * Math.max(0, 1 - d / 2);   // 쉴 땐 뒷줄에 나란히 선다 (로직과 무관, 그림만)
+    g.position.set((d <= dx ? hx - d : f.px) - park - OX, 0, (d <= dx ? hy : hy + d - dx) - OZ);
     g.children[3].visible = busy && f.t < f.go;
   });
+  forkMesh.forEach((g, i) => { g.visible = i < sim.forks.length; });
+  const recv = [...sim.refill.values()].filter(v => v === 'dock').length;
+  recvMesh.forEach((m, i) => { m.visible = i < recv; });
+  inTruck.position.x += ((sim.inboundHere ? IN_X : IN_X + 12) - inTruck.position.x) * 0.08;
+  inTruck.visible = inTruck.position.x < IN_X + 10;
 
   arrows.visible = sim.oneWay;
   dockMesh.forEach((m, i) => { m.visible = i < sim.dock.length; });
@@ -378,8 +402,8 @@ function frame(now) {
   $('nPending').textContent = sim.pending.length;
   $('nBack').textContent = sim.pending.filter(o => !sim.stock[slot(o)]).length;
   $('nOut').textContent = sim.refill.size;
-  $('nRecv').textContent = [...sim.refill.values()].filter(v => v === 'dock').length;
-  for (const [p, st] of [['r', sim.robot], ['t', sim.truck]]) {
+  $('nRecv').textContent = recv;
+  for (const [p, st] of [['r', sim.robot], ['t', sim.truck], ['b', sim.back]]) {
     $(p + 'Rate').textContent = sim.perMin(st).toFixed(1);
     $(p + 'Avg').textContent = st.dur.length ? sim.avgSec(st).toFixed(1) + '초' : '–';
   }

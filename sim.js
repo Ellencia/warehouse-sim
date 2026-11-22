@@ -55,8 +55,9 @@
       // 바닥난 자리 → 'ordered'(다음 입고 트럭을 기다림) | 'dock'(하역장에 내려짐) | 'fork'(지게차가 나르는 중). 넣은 순서대로 처리
       refill: new Map(),
       inboundEvery: opt.inboundEvery ?? 240, inboundT: 0, // 입고 트럭 간격(틱)
+      inboundHere: false,          // 입고 트럭이 대 있는가 (그림용. 짐은 도착한 순간 다 내려진다)
       // 지게차. k = 나르는 자리(-1 쉼), t = 출발 뒤 틱, travel = 편도 틱, go = 채워 넣는 틱. (px,py) = 선반 앞 칸
-      forks: Array.from({ length: opt.forklifts ?? 1 }, () => ({ k: -1, t: 0, travel: 0, go: 0, px: 0, py: 0 })),
+      wantForks: opt.forklifts ?? 1, forks: [], // 지게차 대수 (다음 틱에 맞춰짐)
       forkHome: FORK_HOME,
       stationX: STATION_X, beltPath: BELT, belt: new Array(BELT.length).fill(null), packT: 0,
       dock: [],                    // 포장돼서 트럭을 기다리는 상자
@@ -65,6 +66,7 @@
       t: 0, created: 0, done: 0,
       // 단계별 계측. robot = 주문→포장 끝, truck = 포장 끝→트럭에 실림. log는 끝난 틱, dur는 걸린 틱(최근 50건)
       robot: { log: [], dur: [] }, truck: { log: [], dur: [] },
+      back: { log: [], dur: [] },  // 품절 대기 = 주문이 품절에 막힌 순간→그 자리가 다시 채워짐 (풀린 주문만 잡힌다)
       want: opt.robots ?? 4,       // 로봇 대수 (다음 틱에 맞춰짐)
       rate: opt.rate ?? 20,        // 분당 주문 수
       rule: opt.rule ?? 'nearest', // 'nearest' | 'longestIdle'
@@ -152,7 +154,11 @@
           if (S.belt[k]) return;               // 벨트 칸이 차 있으면 로봇이 작업대에서 기다린다 (역압)
           r.order.bi = r.order.bp = k;
           S.belt[k] = r.order;
-          if (--S.stock[slot(r.order)] === 0) S.refill.set(slot(r.order), 'ordered'); // 바닥나면 발주
+          const sk = slot(r.order);
+          if (--S.stock[sk] === 0) {           // 바닥나면 발주. 그 자리를 기다리던 주문은 지금부터 품절 대기
+            S.refill.set(sk, 'ordered');
+            for (const o of S.pending) if (slot(o) === sk) o.tOut ??= S.t;
+          }
           r.tote = r.order;                   // 물건은 벨트로, 빈 상자는 로봇이 도로 가져간다
           r.order = null; r.state = 'toReturn';
         } else {
@@ -210,11 +216,16 @@
     // ponytail: 트럭은 도착한 순간 통째로 내린다(하역 시간 없음). 지게차는 로봇 칸을 차지하지 않고 지나간다
     // (하역장→뒷줄→통로, 거리만큼 시간만 든다). 지게차가 통로를 막는 효과를 보려면 로봇과 같은 occ 격자에 올릴 것.
     function inbound() {
+      while (S.forks.length > S.wantForks) {
+        const f = S.forks.pop();
+        if (f.k >= 0 && f.t < f.go) S.refill.set(f.k, 'dock'); // 들고 가던 상자는 하역장에 도로 놓인 셈 친다
+      }
+      while (S.forks.length < S.wantForks) S.forks.push({ k: -1, t: 0, travel: 0, go: 0, px: 0, py: 0 });
       if (++S.inboundT >= S.inboundEvery) {
-        S.inboundT = 0;
+        S.inboundT = 0; S.inboundHere = true;
         let n = INBOUND_CAP;
         for (const [k, v] of S.refill) if (v === 'ordered' && n-- > 0) S.refill.set(k, 'dock');
-      }
+      } else if (S.inboundT >= TRUCK_STAY) S.inboundHere = false;
       for (const f of S.forks) {
         if (f.k < 0) {
           const hit = [...S.refill].find(([, v]) => v === 'dock');
@@ -226,7 +237,11 @@
           f.go = f.travel + PICK_TICKS + LEVEL_TICKS * (k % LEVELS);
         }
         f.t++;
-        if (f.t === f.go) { S.stock[f.k] = STOCK_CAP; S.refill.delete(f.k); }
+        if (f.t === f.go) {
+          S.stock[f.k] = STOCK_CAP; S.refill.delete(f.k);
+          let n = STOCK_CAP;                   // 이번 상자로 풀리는 주문만 센다. 넘치는 주문은 다음 상자 때
+          for (const o of S.pending) if (slot(o) === f.k && n-- > 0) { mark(S.back, S.t - o.tOut); delete o.tOut; }
+        }
         if (f.t >= f.go + f.travel) f.k = -1;
       }
     }
@@ -246,7 +261,7 @@
 
     function tick() {
       S.t++;
-      for (const st of [S.robot, S.truck]) while (st.log[0] <= S.t - WINDOW) st.log.shift();
+      for (const st of [S.robot, S.truck, S.back]) while (st.log[0] <= S.t - WINDOW) st.log.shift();
       syncRobots();
       truck();
       moveBelt();
@@ -254,7 +269,9 @@
       const e = S.rate / 60 / TPS;
       for (let n = Math.floor(e) + (rng() < e % 1 ? 1 : 0); n > 0; n--) {
         const { s, level } = skus[(skus.length * rng() ** 2) | 0]; // 제곱이라 앞쪽(인기 물건)이 훨씬 자주 뽑힌다
-        S.pending.push({ id: ++S.created, shelf: s.cell, level, pick: s.pick, t0: S.t });
+        const o = { id: ++S.created, shelf: s.cell, level, pick: s.pick, t0: S.t };
+        if (!S.stock[slot(o)]) o.tOut = S.t;   // 들어올 때부터 품절
+        S.pending.push(o);
       }
       assign();
       for (const r of S.robots) { r.prev = r.cell; step(r); }
@@ -273,7 +290,10 @@
         if (i === 18000) doneAt = S.done;
         if (robots === 12 && i === 8000) S.want = 3;   // 도중에 로봇을 빼고
         if (robots === 12 && i === 12000) S.want = 12; // 다시 넣어도 주문이 새지 않아야 한다
+        if (robots === 12) S.wantForks = i >= 6000 && i < 10000 ? 3 : i >= 10000 && i < 14000 ? 0 : 1; // 지게차도 넣었다 뺐다
         S.tick();
+        assert(S.back.dur.every(d => d >= 0), '품절 대기 시간이 이상하다'); // 막힌 시각이 안 찍힌 주문이면 NaN
+        assert(S.pending.every(o => !!S.stock[o.shelf * LEVELS + o.level] || o.tOut !== undefined), '품절 주문에 막힌 시각이 없다');
         const cells = S.robots.map(r => r.cell);
         assert.strictEqual(new Set(cells).size, cells.length, '두 로봇이 한 칸에');
         for (const r of S.robots) {
@@ -288,7 +308,7 @@
         assert.strictEqual(S.out.size,S.robots.filter(r => r.order || r.tote).length, '나간 상자 수가 안 맞는다');
       }
       assert(S.done > doneAt, '교착: 마지막 2000틱 동안 완료 0건');
-      console.log(`로봇 ${robots} · 분당 ${rate} · ${rule}${oneWay ? ' · 일방통행' : ''}: 완료 ${S.done}/${S.created}, 대기 ${S.pending.length}(품절 ${S.pending.filter(o => !S.stock[o.shelf * LEVELS + o.level]).length}), 품절 자리 ${S.refill.size}(${['ordered', 'dock', 'fork'].map(v => [...S.refill.values()].filter(x => x === v).length).join('/')}), 로봇 단계 ${S.perMin(S.robot).toFixed(1)}/분 ${S.avgSec(S.robot).toFixed(1)}초, 트럭 단계 ${S.perMin(S.truck).toFixed(1)}/분 ${S.avgSec(S.truck).toFixed(1)}초`);
+      console.log(`로봇 ${robots} · 분당 ${rate} · ${rule}${oneWay ? ' · 일방통행' : ''}: 완료 ${S.done}/${S.created}, 대기 ${S.pending.length}(품절 ${S.pending.filter(o => !S.stock[o.shelf * LEVELS + o.level]).length}), 품절 자리 ${S.refill.size}(${['ordered', 'dock', 'fork'].map(v => [...S.refill.values()].filter(x => x === v).length).join('/')}), 로봇 단계 ${S.perMin(S.robot).toFixed(1)}/분 ${S.avgSec(S.robot).toFixed(1)}초, 트럭 단계 ${S.perMin(S.truck).toFixed(1)}/분 ${S.avgSec(S.truck).toFixed(1)}초, 품절 대기 ${S.avgSec(S.back).toFixed(1)}초`);
     }
     // 트럭이 오든 말든 로봇 단계는 똑같이 돌아야 한다 (같은 씨앗이면 포장된 수가 정확히 같다)
     const packed = truckEvery => {
